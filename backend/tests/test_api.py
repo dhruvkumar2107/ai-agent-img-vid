@@ -1,6 +1,7 @@
 import io
 
 import pytest
+import qrcode
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -8,6 +9,7 @@ import main
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 FAKE_MP4 = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 128
+STUDIO_URL = "https://studio.example.com"
 
 
 def make_png_bytes(color=(255, 0, 120)) -> bytes:
@@ -28,6 +30,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "IMAGE_DIR", images)
     monkeypatch.setattr(main, "QR_DIR", qrcodes)
     monkeypatch.setattr(main, "META_PATH", tmp_path / "uploads.json")
+    monkeypatch.setattr(main, "PUBLIC_BASE_URL", STUDIO_URL)
     with TestClient(main.app) as test_client:
         yield test_client
 
@@ -135,7 +138,7 @@ def test_stats_and_media_listing(client):
     assert stats["total_media"] == 0
     assert stats["total_qr_codes"] == 0
     assert stats["storage_bytes"] == 0
-    assert stats["public_base_url"] == main.PUBLIC_BASE_URL
+    assert stats["public_base_url"] == STUDIO_URL
 
     uploaded = client.post("/api/upload", files=upload_files()).json()
     photo = client.post("/api/upload", files=upload_photo()).json()
@@ -215,7 +218,130 @@ def test_sync_meta_backfills_existing_files(client):
     assert main.META_PATH.exists()
 
 
+def test_sync_meta_ignores_placeholder_files(client):
+    (main.VIDEO_DIR / ".gitkeep").write_text("")
+    (main.IMAGE_DIR / ".gitkeep").write_text("")
+    (main.QR_DIR / ".gitkeep").write_text("")
+
+    meta = main.sync_meta()
+
+    assert ".gitkeep" not in meta
+    items = client.get("/api/media").json()["media"]
+    assert all(item["id"] != ".gitkeep" for item in items)
+    assert client.get("/api/stats").json()["total_qr_codes"] == 0
+
+
+def test_sync_meta_drops_placeholder_metadata(client):
+    meta = {
+        ".gitkeep": {
+            "id": ".gitkeep",
+            "filename": ".gitkeep",
+            "extension": "",
+            "size_bytes": 0,
+            "created_at": "2026-01-01T00:00:00+00:00",
+        }
+    }
+    main.save_meta(meta)
+
+    synced = main.sync_meta()
+
+    assert ".gitkeep" not in synced
+    assert client.get("/api/media").json()["media"] == []
+
+
 def test_qr_points_to_the_public_media_url(client):
     uploaded = client.post("/api/upload", files=upload_photo()).json()
-    assert uploaded["media_url"] == f"{main.PUBLIC_BASE_URL}/images/{uploaded['id']}.png"
-    assert uploaded["qr_url"] == f"{main.PUBLIC_BASE_URL}/qrcodes/{uploaded['id']}.png"
+    assert uploaded["media_url"] == f"{STUDIO_URL}/images/{uploaded['id']}.png"
+    assert uploaded["qr_url"] == f"{STUDIO_URL}/qrcodes/{uploaded['id']}.png"
+
+
+def test_public_base_url_defaults_to_the_request_host(client, monkeypatch):
+    monkeypatch.setattr(main, "PUBLIC_BASE_URL", "")
+
+    response = client.get(
+        "/api/stats",
+        headers={"host": "api.example.com", "x-forwarded-proto": "https"},
+    )
+
+    assert response.json()["public_base_url"] == "https://api.example.com"
+
+
+def test_public_base_url_falls_back_to_request_host(client, monkeypatch):
+    monkeypatch.setattr(main, "PUBLIC_BASE_URL", "http://localhost:8000")
+
+    response = client.get(
+        "/api/stats",
+        headers={"host": "api.example.com", "x-forwarded-proto": "https"},
+    )
+
+    assert response.json()["public_base_url"] == "https://api.example.com"
+
+
+def test_public_base_url_honours_forwarded_host(client, monkeypatch):
+    monkeypatch.setattr(main, "PUBLIC_BASE_URL", "")
+
+    response = client.get(
+        "/api/stats",
+        headers={
+            "host": "internal.render.internal",
+            "x-forwarded-host": "ai-agent-img-vid.onrender.com",
+            "x-forwarded-proto": "https",
+        },
+    )
+
+    assert (
+        response.json()["public_base_url"] == "https://ai-agent-img-vid.onrender.com"
+    )
+
+
+def test_public_base_url_keeps_explicit_configuration(client, monkeypatch):
+    monkeypatch.setattr(main, "PUBLIC_BASE_URL", "https://cdn.example.com")
+
+    response = client.get("/api/stats", headers={"host": "api.example.com"})
+
+    assert response.json()["public_base_url"] == "https://cdn.example.com"
+
+
+def test_uploaded_urls_use_the_request_origin(client, monkeypatch):
+    monkeypatch.setattr(main, "PUBLIC_BASE_URL", "")
+
+    uploaded = client.post(
+        "/api/upload",
+        files=upload_photo(),
+        headers={"host": "api.example.com", "x-forwarded-proto": "https"},
+    ).json()
+
+    assert uploaded["media_url"] == f"https://api.example.com/images/{uploaded['id']}.png"
+    assert uploaded["qr_url"] == f"https://api.example.com/qrcodes/{uploaded['id']}.png"
+
+
+def test_qr_code_is_regenerated_when_the_public_origin_changes(client, monkeypatch):
+    uploaded = client.post("/api/upload", files=upload_photo()).json()
+    qr_path = main.QR_DIR / f"{uploaded['id']}.png"
+    original = qr_path.read_bytes()
+
+    monkeypatch.setattr(main, "PUBLIC_BASE_URL", "https://new-host.example.com")
+    client.get("/api/media")
+
+    regenerated = qr_path.read_bytes()
+    assert regenerated != original
+
+    expected = io.BytesIO()
+    qrcode.make(f"https://new-host.example.com/images/{uploaded['id']}.png").save(
+        expected, format="PNG"
+    )
+    assert regenerated == expected.getvalue()
+
+
+def test_media_listing_uses_the_current_public_origin(client, monkeypatch):
+    uploaded = client.post("/api/upload", files=upload_photo()).json()
+
+    monkeypatch.setattr(main, "PUBLIC_BASE_URL", "")
+    items = client.get(
+        "/api/media",
+        headers={"host": "api.example.com", "x-forwarded-proto": "https"},
+    ).json()["media"]
+
+    entry = next(item for item in items if item["id"] == uploaded["id"])
+    assert entry["media_url"] == f"https://api.example.com/images/{uploaded['id']}.png"
+    assert entry["qr_url"] == f"https://api.example.com/qrcodes/{uploaded['id']}.png"
